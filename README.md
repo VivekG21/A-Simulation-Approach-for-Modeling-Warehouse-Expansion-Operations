@@ -1,0 +1,2 @@
+# A-Simulation-Approach-for-Modeling-Warehouse-Expansion-Operations
+The warehouse under consideration has a goal of improving service at its facility by pursuing two options: increasing the number of fork lift operators (servers) and/or increasing the number of warehouse docks (loading bays). Simulation is used as a modeling tool to predict service improvement levels for various combinations of these two options.
