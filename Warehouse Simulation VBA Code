@@ -1,0 +1,344 @@
+' Code illustrating use of VBASim for WAREHOUSE simulation
+
+
+' See VBASim module for generic declarations
+' See Class Modules for the supporting VBASim classes
+Public Const Nservers = 3
+Public Const DockSize = 4
+Public Const PhasesFork = 4
+Public Const PhasesLoad = 3
+' PLEASE SEE TAB Determining_REPS_Worksheet and lines 100-108 in that tab for details of how 1600 was arrived at.
+Public Const NREPS = 1600
+
+' If ImplementNHPPArrivals = 0, NO NHPP implemented, if ImplementNHPPArrivals = 1, use a flat rate (page 130 of book)
+' and if ImplementNHPPArrivals = 2, implement thinning (as outlined in lecture power point)
+
+Public Const ImplementNHPPArrivals = 2
+
+' Parameters we may want to change
+Private MeanTBA As Double        ' mean time between arrivals
+Private MeanSTFork As Double ' this var models average Fork operator time
+Private MeanSTLoad As Double ' Models the driver's load time
+Private MeanST As Double         ' mean service time
+Private Phases As Integer        ' number of phases in service distribution
+Private RunLength As Double      ' run length
+Private WarmUp As Double         ' "warm-up
+Private TotalDockTrucks As Integer ' Indicates a running count of total number of trucks = (being served + waiting for server) in the warehouse docks
+Private arrChangeTime As Double
+Public NHPP_RATES(1 To 9) As Double
+Public ThinProbArray(1 To 9) As Double
+Public ThinningProb As Double
+Public MaxLambdaRate As Double
+Public NHPP_EPOCH As Integer
+
+Private NumCalls As Integer  ' Record TOTAL number of calls
+' Global objects needed for simulation
+' These will usually be queues and statistics
+
+Dim Queue As New FIFOQueue          'customer = truck queue
+Dim DockQueue As New FIFOQueue      'queue = trucks who are waiting in the dock area, docked but without a Fork Lift available
+Dim Wait As New DTStat              'discrete-time statistics on customer waiting
+Dim DockWait As New DTStat
+Dim ServiceEndStats As New DTStat
+Dim LoadEndStats As New DTStat
+
+' Dim NumLostCalls As New DTStat      ' discrete-time statistics on number of calls lost
+Dim Server As New Resource          'server resource
+Dim WarehouseDock As New Resource
+
+Private Sub Warehouse()
+' Initialize
+    Dim Reps As Integer
+    Dim NextEvent As EventNotice
+    Dim i As Integer
+    Dim j As Integer
+    
+    Call MyInit ' special initializations for this simulation
+    
+    For Reps = 1 To NREPS
+        NumCalls = 0
+        TotalDockTrucks = 0
+        arrChangeTime = 0
+        Call VBASimInit 'initialize VBASim for each replication
+    
+        Call Schedule("Arrival", Expon(MeanTBA, 1))
+        Call Schedule("EndSimulation", RunLength)
+        Call Schedule("ClearIt", WarmUp)
+        If ImplementNHPPArrivals >= 1 Then
+            For j = 1 To 9
+                arrChangeTime = WarmUp + (j - 1) * 60
+                Call Schedule("UpdateMeanTBAorThinningProb", arrChangeTime)
+            Next j
+        End If
+    
+        Do
+            Set NextEvent = Calendar.Remove
+            Clock = NextEvent.EventTime
+            Select Case NextEvent.EventType
+            Case "Arrival"
+                Call Arrival
+                NumCalls = NumCalls + 1
+            Case "UpdateMeanTBAorThinningProb"
+                Call UpdateMeanTBAorThinningProb
+            Case "EndOfService"
+                Call EndOfService(NextEvent.WhichObject)
+            Case "EndOfLoading"
+                Call EndOfLoading(NextEvent.WhichObject)
+            Case "ClearIt"
+                Call ClearStats
+                NumCalls = 0
+            End Select
+        Loop Until NextEvent.EventType = "EndSimulation"
+
+' Write output report for each replication
+
+        Call Report(Wait.Mean, "WarehouseSim", Reps + 1, 1)
+        Call Report(Queue.Mean, "WarehouseSim", Reps + 1, 2)
+        Call Report(Queue.NumQueue, "WarehouseSim", Reps + 1, 3)
+        Call Report(Server.Mean, "WarehouseSim", Reps + 1, 4)
+        Call Report(Nservers, "WarehouseSim", Reps + 1, 5)
+        Call Report(DockQueue.Mean, "WarehouseSim", Reps + 1, 6)
+        Call Report(DockWait.Mean, "WarehouseSim", Reps + 1, 7)
+        Call Report(WarehouseDock.Mean, "WarehouseSim", Reps + 1, 8)
+        Call Report(DockSize, "WarehouseSim", Reps + 1, 9)
+        ' The metric below measures average TOTAL system time for trucks when loading is completed.
+        Call Report(LoadEndStats.Mean, "WarehouseSim", Reps + 1, 10)
+    
+    Next Reps
+    
+    End ' ends execution, closes files, etc.
+    
+End Sub
+Private Sub Arrival()
+    Dim IAT As Double
+    Dim localMeanTBA As Double
+' Arrival event
+' Schedule next arrival
+    If ImplementNHPPArrivals = 0 Then
+        ' BASE CASE:  Arrivals are homogeneous
+        Call Schedule("Arrival", Expon(MeanTBA, 1))
+    ElseIf ImplementNHPPArrivals = 1 Then
+        ' This implements the simple method in page 130 of the book.  No thinning but Lambda updated every hour.
+        Call Schedule("Arrival", Expon(MeanTBA, 1))
+    ElseIf ImplementNHPPArrivals = 2 Then
+        ' This implements Thinning as discussed in the power point provided for NHPP. ImplementNHPPArrivals = 2 and ImplementNHPPArrivals = 1
+        ' should provide answers that are close together...
+        ' IAT = InterArrivalTime
+        ThinningProb = ThinProbArray(NHPP_EPOCH)
+        IAT = GetThinnedIAT(ThinningProb)
+        ' MsgBox (IAT) ' This was used for debugging...Ignore.
+        Call Schedule("Arrival", IAT)
+        ' localMeanTBA = 1 / (MaxLambdaRate * ThinProbArray(NHPP_EPOCH))
+        ' Call Schedule("Arrival", Expon(localMeanTBA, 1))
+    End If
+    
+' Create and Process the newly arriving customer
+    Dim Customer As New Entity
+' If Docks can accommodate new arrival, place in dock else place in parking lot
+' If fork lift operator is free schedule end of service as soon as the arrival happens, else place in Dock Queue waiting for fork lift
+    If TotalDockTrucks = DockSize Then
+        Queue.Add Customer
+    ElseIf (Server.Busy = Nservers) And (TotalDockTrucks < DockSize) Then
+        WarehouseDock.Seize (1)
+        DockQueue.Add Customer
+        TotalDockTrucks = TotalDockTrucks + 1
+        Customer.DockWaitStart = Clock
+        ' For such a customer note that the Parking Lot wait time = 0
+        Wait.Record (Clock - Customer.CreateTime)
+    ElseIf (Server.Busy < Nservers) And (TotalDockTrucks < DockSize) Then
+        Server.Seize (1)
+        WarehouseDock.Seize (1)
+        Call SchedulePlus("EndOfService", Erlang(PhasesFork, MeanSTFork, 2), Customer)
+        TotalDockTrucks = TotalDockTrucks + 1
+        Customer.DockWaitStart = Clock
+        Customer.DockWaitEnd = Clock
+        DockWait.Record (Customer.DockWaitEnd - Customer.DockWaitStart)
+        Wait.Record (Clock - Customer.CreateTime)
+    End If
+    
+    Set Customer = Nothing
+End Sub
+Private Sub EndOfService(DepartingCustomer As Entity)
+' End of service event
+' Now that service is over, schedule the LOADING part
+    DepartingCustomer.ServiceEnd = Clock
+    ServiceEndStats.Record (Clock - DepartingCustomer.CreateTime)
+    ' NOTE: TotalDockTrucks does not really change when a fork lift service finishes.
+    
+    Call SchedulePlus("EndOfLoading", Erlang(PhasesLoad, MeanSTLoad, 3), DepartingCustomer)
+    Set DepartingCustomer = Nothing 'be sure to free up memory
+' Check if there is another customer in the Dock Queue that needs the fork lift.  If yes schedule another EndOfService, else free server
+' NOTE:  We can ignore the DockQueue in EndOfService IF Nservers = DockSize because end of service does not free up dock space per se
+' In the special case above, DockQueue.NumQueue = 0 ALWAYS!!
+    If DockQueue.NumQueue > 0 Then
+        Set DepartingCustomer = DockQueue.Remove
+        DepartingCustomer.DockWaitEnd = Clock
+        DockWait.Record (DepartingCustomer.DockWaitEnd - DepartingCustomer.DockWaitStart)
+        Call SchedulePlus("EndOfService", Erlang(PhasesFork, MeanSTFork, 2), DepartingCustomer)
+        Set DepartingCustomer = Nothing 'be sure to free up memory
+    Else
+        Server.Free (1)
+    End If
+
+End Sub
+Private Sub EndOfLoading(DepartingCustomer As Entity)
+' End of service + load event.  Free up warehouse dock space
+    DepartingCustomer.LoadEnd = Clock
+    LoadEndStats.Record (Clock - DepartingCustomer.CreateTime)
+    
+    Set DepartingCustomer = Nothing    'be sure to free up memory
+    TotalDockTrucks = TotalDockTrucks - 1
+' Check to see if there is another customer waiting in the dock; if yes start service
+' otherwise free the server
+    If Queue.NumQueue > 0 Then
+        Set DepartingCustomer = Queue.Remove
+        Wait.Record (Clock - DepartingCustomer.CreateTime)
+        If Server.Busy < Nservers And TotalDockTrucks < DockSize Then
+            Server.Seize (1)
+            DepartingCustomer.DockWaitStart = Clock
+            DepartingCustomer.DockWaitEnd = Clock
+            DockWait.Record (DepartingCustomer.DockWaitEnd - DepartingCustomer.DockWaitStart)
+            Call SchedulePlus("EndOfService", Erlang(PhasesFork, MeanSTFork, 2), DepartingCustomer)
+            TotalDockTrucks = TotalDockTrucks + 1
+        ElseIf Server.Busy = Nservers And TotalDockTrucks < DockSize Then
+            DockQueue.Add DepartingCustomer
+            TotalDockTrucks = TotalDockTrucks + 1
+            DepartingCustomer.DockWaitStart = Clock
+        ElseIf Server.Busy = Nservers And TotalDockTrucks = DockSize Then
+            MsgBox ("THIS CONDITION SHOULD NEVER HAPPEN - FATAL ERROR?")
+        End If
+        Set DepartingCustomer = Nothing 'be sure to free up memory
+    Else
+        WarehouseDock.Free (1)
+    End If
+End Sub
+
+Public Sub UpdateMeanTBAorThinningProb()
+' Data for NHPP
+' MeanTBA 16.51376147 9.32642487  11.39240506 22.22222222 33.33333333 20.2247191  23.37662338 60  150
+    Dim jj As Integer
+    Dim localIndex As Integer
+    localIndex = 1
+    For jj = 1 To 9
+        If (Clock >= WarmUp + (jj - 1) * 60) And (Clock < WarmUp + (jj) * 60) Then
+            localIndex = jj
+            Exit For
+        End If
+    Next jj
+    NHPP_EPOCH = localIndex
+    If ImplementNHPPArrivals = 1 Then
+        MeanTBA = NHPP(localIndex)
+    ElseIf ImplementNHPPArrivals = 2 Then
+        MeanTBA = 1 / MaxLambdaRate
+        ThinningProb = ThinProbArray(localIndex)
+        ' If 1 / (MaxLambdaRate * ThinningProb) <> NHPP(localIndex) Then
+        '    MsgBox ("Thinning rate and NHPP array do not match up?")
+        ' End If
+    End If
+End Sub
+
+Public Function GetThinnedIAT(ThinningProb As Double) As Double
+    Dim localIAT As Double
+    Dim localFlag As Integer
+    
+    localIAT = 0
+    localFlag = 0
+    ' NOTE:  ThinningProb is already the ratio of current lambda/max-lambda, so can compare U to ThinningProb directly
+    ' NOTE:  If this function is even called, MeanTBA = Min (MeanTBA) across all 9 hours
+    
+    Do
+        localIAT = localIAT + Expon(MeanTBA, 1)
+        ' NOTE:  Seed for Uniform is 4 because seeds 1, 2 and 3 have been used for Arrivals, Fork Service and Loading respectively.
+        If Uniform(0, 1, 4) <= ThinningProb Then
+            localFlag = 1
+            GetThinnedIAT = localIAT
+            ' Exit Function
+        End If
+    Loop Until localFlag = 1
+End Function
+
+
+
+Private Sub MyInit()
+    
+' Initialize the simulation
+    Call InitializeRNSeed
+    Server.SetUnits (Nservers) ' set the number of servers to 1
+    WarehouseDock.SetUnits (DockSize) ' set the number of warehouse docks to a constant called DockSize
+    
+    MeanTBA = 18
+    MeanSTFork = 40
+    MeanSTLoad = 12
+    ' MsgBox (MeanST)
+    Phases = 3
+    ' RunLength = 50000
+    RunLength = 540 ' REMEMBER TO ACTIVATE THIS AFTER DEBUGGING
+    WarmUp = 5000
+    
+' Add queues, resources and statistics that need to be
+' initialized between replications to the global collections
+
+    TheDTStats.Add Wait
+    TheDTStats.Add DockWait
+    TheDTStats.Add ServiceEndStats
+    TheDTStats.Add LoadEndStats
+    
+    ' TheDTStats.Add NumLostCalls
+    TheQueues.Add Queue
+    TheQueues.Add DockQueue
+    TheResources.Add Server
+    TheResources.Add WarehouseDock
+    ' INITIALIZE NHPP array - may not be used if even rates are modeled
+    ' MeanTBA 16.51376147 9.32642487  11.39240506 22.22222222 33.33333333 20.2247191  23.37662338 60  150
+    ' ThinningProb    0.564766839 1   0.81865285  0.419689119 0.279792746 0.461139896 0.398963731 0.155440415 0.062176166
+    If ImplementNHPPArrivals = 0 Then
+        MeanTBA = 18
+    ElseIf ImplementNHPPArrivals = 1 Then
+        ' NOTE:  This is set at MeanTBA in hour 1 for this method
+        MeanTBA = 16.51
+    ElseIf ImplementNHPPArrivals = 2 Then
+        ' NOTE:  This is set at MeanTBA in fastest arrival hour for this method
+        MeanTBA = 9.326
+    End If
+    MaxLambdaRate = 1 / 9.32
+    NHPP_RATES(1) = 16.51
+    NHPP_RATES(2) = 9.32
+    NHPP_RATES(3) = 11.39
+    NHPP_RATES(4) = 22.22
+    NHPP_RATES(5) = 33.33
+    NHPP_RATES(6) = 20.22
+    NHPP_RATES(7) = 23.37
+    NHPP_RATES(8) = 60
+    NHPP_RATES(9) = 150
+    NHPP_EPOCH = 1
+    ' Populate thinning prob array
+    ThinningProb = 1
+    ThinProbArray(1) = 0.5648
+    ThinProbArray(2) = 1
+    ThinProbArray(3) = 0.819
+    ThinProbArray(4) = 0.42
+    ThinProbArray(5) = 0.28
+    ThinProbArray(6) = 0.4611
+    ThinProbArray(7) = 0.399
+    ThinProbArray(8) = 0.155
+    ThinProbArray(9) = 0.062
+' Write headings for the output reports
+
+    Call Report("Average ParkingLot Wait", "WarehouseSim", 1, 1)
+    Call Report("Average Number in ParkingLot Queue", "WarehouseSim", 1, 2)
+    Call Report("Number Remaining in ParkingLot", "WarehouseSim", 1, 3)
+    Call Report("Server Utilization", "WarehouseSim", 1, 4)
+    Call Report("No. Servers", "WarehouseSim", 1, 5)
+    
+    Call Report("Ave Num in Dock (Loading Bay) Que", "WarehouseSim", 1, 6)
+    Call Report("Ave Wait in Dock (Loading Bay)", "WarehouseSim", 1, 7)
+    Call Report("Dock (Loading Bay) Utilization", "WarehouseSim", 1, 8)
+    Call Report("DockSize (Loading Bay Size)", "WarehouseSim", 1, 9)
+    Call Report("Total System Time", "WarehouseSim", 1, 10)
+End Sub
+
+
+
+
+
+ 
